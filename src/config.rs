@@ -121,6 +121,7 @@ pub struct RailwayConfig {
 pub struct Configs {
     pub root_config: RailwayConfig,
     root_config_path: PathBuf,
+    original: std::sync::Mutex<Option<String>>,
     /// Per-instance snapshot of the `RAILWAY_BACKBOARD_URL` debug-build
     /// escape hatch, taken at construction (see
     /// [`Configs::backboard_url_override_from_env`]). Always `None` in
@@ -138,34 +139,14 @@ impl Configs {
     pub fn new() -> Result<Self> {
         let root_config_path = Self::root_config_path()?;
 
-        if let Ok(mut file) = File::open(&root_config_path) {
-            let mut serialized_config = vec![];
-            file.read_to_end(&mut serialized_config)?;
-
-            let root_config: RailwayConfig = serde_json::from_slice(&serialized_config)
-                .unwrap_or_else(|_| {
-                    crate::util::reporter::warn(
-                        "CONFIG_UNPARSEABLE",
-                        "Unable to parse config file, regenerating",
-                        None,
-                    );
-                    RailwayConfig::default()
-                });
-
-            let config = Self {
-                root_config,
-                root_config_path,
-                backboard_url_override: Self::backboard_url_override_from_env(),
-            };
-
-            return Ok(config);
-        }
-
-        Ok(Self {
+        let mut config = Self {
             root_config_path,
             root_config: RailwayConfig::default(),
+            original: Default::default(),
             backboard_url_override: Self::backboard_url_override_from_env(),
-        })
+        };
+        config.reload()?;
+        Ok(config)
     }
 
     /// Debug-build-only escape hatch so a locally-built binary (or an
@@ -193,9 +174,9 @@ impl Configs {
     /// Absolute path to the root config file for the current environment.
     fn root_config_path() -> Result<PathBuf> {
         let root_config_partial_path = match Self::get_environment_id() {
-            Environment::Production => ".railway/config.json",
-            Environment::Staging => ".railway/config-staging.json",
-            Environment::Dev => ".railway/config-dev.json",
+            Environment::Production => ".railway-irnbru/config.json",
+            Environment::Staging => ".railway-irnbru/config-staging.json",
+            Environment::Dev => ".railway-irnbru/config-dev.json",
         };
 
         let home_dir = dirs::home_dir().context("Unable to get home directory")?;
@@ -207,6 +188,12 @@ impl Configs {
     /// freshly written by another concurrent process.
     pub fn reload(&mut self) -> Result<()> {
         self.root_config = Self::read_root_config(&self.root_config_path).unwrap_or_default();
+        let record = crate::irnbru::exchange("use", None, None)?;
+        self.root_config.user = match &record {
+            Some(raw) => serde_json::from_str(raw)?,
+            None => RailwayUser::default(),
+        };
+        *self.original.get_mut().unwrap() = record;
         Ok(())
     }
 
@@ -359,6 +346,7 @@ impl Configs {
     #[cfg(test)]
     pub(crate) fn for_test(root_config_path: PathBuf) -> Self {
         Self {
+            original: Default::default(),
             root_config: RailwayConfig::default(),
             root_config_path,
             backboard_url_override: Self::backboard_url_override_from_env(),
@@ -925,8 +913,23 @@ impl Configs {
     /// ([`Self::save_oauth_tokens`]), a dead grant
     /// ([`Self::clear_oauth_tokens`]), and logout.
     pub(crate) fn write_credentials(&self) -> Result<()> {
-        let value = serde_json::to_value(&self.root_config)?;
-        self.write_value(&value)
+        let user = &self.root_config.user;
+        let value = if user.token.is_some()
+            || user.access_token.is_some()
+            || user.refresh_token.is_some()
+        {
+            Some(serde_json::to_string(user)?)
+        } else {
+            None
+        };
+        let mut original = self.original.lock().unwrap();
+        crate::irnbru::exchange(
+            if value.is_some() { "save" } else { "delete" },
+            original.as_deref(),
+            value.as_deref(),
+        )?;
+        *original = value;
+        self.write()
     }
 
     fn write_value(&self, value: &serde_json::Value) -> Result<()> {
@@ -964,7 +967,9 @@ impl Configs {
         let tmp_file = options.open(&tmp_file_path)?;
         // An existing tmp file keeps its old mode, so enforce it either way.
         secure_config_file(&tmp_file_path)?;
-        serde_json::to_writer_pretty(&tmp_file, value)?;
+        let mut preferences = value.clone();
+        preferences["user"] = serde_json::json!({});
+        serde_json::to_writer_pretty(&tmp_file, &preferences)?;
         tmp_file.sync_all()?;
 
         // Rename to the final destination. `rename_replacing` is atomic on both
@@ -1042,6 +1047,7 @@ mod tests {
 
     fn empty_configs() -> Configs {
         Configs {
+            original: Default::default(),
             root_config_path: std::path::PathBuf::new(),
             root_config: RailwayConfig::default(),
             backboard_url_override: None,

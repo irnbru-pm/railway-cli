@@ -26,6 +26,7 @@ mod exec_context;
 mod gql;
 #[cfg(test)]
 mod help_tests;
+mod irnbru;
 mod oauth;
 mod resources;
 mod subscription;
@@ -238,6 +239,7 @@ async fn background_stage_update(version: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    crate::irnbru::init()?;
     // Internal: detached background download spawned by a prior invocation.
     if let Ok(version) = std::env::var(consts::RAILWAY_STAGE_UPDATE_ENV) {
         return background_stage_update(&version).await;
